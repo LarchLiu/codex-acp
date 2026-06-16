@@ -1641,7 +1641,13 @@ impl PromptState {
                     .status(ToolCallStatus::Pending)
                     .title(title)
                     .locations(locations)
-                    .content(content.chain(reason.map(|r| r.into())).collect::<Vec<_>>())
+                    .content({
+                        let mut content = content;
+                        if let Some(reason) = reason {
+                            content.push(reason.into());
+                        }
+                        content
+                    })
                     .raw_input(raw_input),
             ),
             options,
@@ -1665,7 +1671,7 @@ impl PromptState {
                 .kind(ToolKind::Edit)
                 .status(ToolCallStatus::InProgress)
                 .locations(locations)
-                .content(content.collect())
+                .content(content)
                 .raw_input(raw_input),
         );
     }
@@ -1687,7 +1693,7 @@ impl PromptState {
                 .status(ToolCallStatus::InProgress)
                 .title(title)
                 .locations(locations)
-                .content(content.collect::<Vec<_>>())
+                .content(content)
                 .raw_input(raw_input),
         ));
     }
@@ -1706,7 +1712,7 @@ impl PromptState {
 
         let (title, locations, content) = if !changes.is_empty() {
             let (title, locations, content) = extract_tool_call_content_from_changes(changes);
-            (Some(title), Some(locations), Some(content.collect()))
+            (Some(title), Some(locations), Some(content))
         } else {
             (None, None, None)
         };
@@ -3749,11 +3755,7 @@ fn format_uri_as_link(name: Option<String>, uri: String) -> String {
 
 fn extract_tool_call_content_from_changes(
     changes: HashMap<PathBuf, FileChange>,
-) -> (
-    String,
-    Vec<ToolCallLocation>,
-    impl Iterator<Item = ToolCallContent>,
-) {
+) -> (String, Vec<ToolCallLocation>, Vec<ToolCallContent>) {
     let changes = changes.into_iter().collect_vec();
     let title = if changes.is_empty() {
         "Edit".to_string()
@@ -3768,13 +3770,15 @@ fn extract_tool_call_content_from_changes(
                 .join(", ")
         )
     };
-    let locations = changes
-        .iter()
-        .map(|(path, change)| ToolCallLocation::new(tool_call_location_for_change(path, change)))
-        .collect_vec();
-    let content = changes
-        .into_iter()
-        .flat_map(|(path, change)| extract_tool_call_content_from_change(path, change));
+
+    let mut locations = Vec::new();
+    let mut content = Vec::new();
+
+    for (path, change) in changes {
+        let (change_locations, change_content) = extract_tool_call_content_from_change(path, change);
+        locations.extend(change_locations);
+        content.extend(change_content);
+    }
 
     (title, locations, content)
 }
@@ -3792,13 +3796,19 @@ fn tool_call_location_for_change(path: &Path, change: &FileChange) -> PathBuf {
 fn extract_tool_call_content_from_change(
     path: PathBuf,
     change: FileChange,
-) -> Vec<ToolCallContent> {
+) -> (Vec<ToolCallLocation>, Vec<ToolCallContent>) {
     match change {
-        FileChange::Add { content } => vec![ToolCallContent::Diff(Diff::new(path, content))],
+        FileChange::Add { content } => (
+            vec![ToolCallLocation::new(path.clone())],
+            vec![ToolCallContent::Diff(Diff::new(path, content))],
+        ),
         FileChange::Delete { content } => {
-            vec![ToolCallContent::Diff(
-                Diff::new(path, String::new()).old_text(content),
-            )]
+            (
+                vec![ToolCallLocation::new(path.clone())],
+                vec![ToolCallContent::Diff(
+                    Diff::new(path, String::new()).old_text(content),
+                )],
+            )
         }
         FileChange::Update {
             unified_diff,
@@ -3810,42 +3820,73 @@ fn extract_tool_call_content_from_change(
 fn extract_tool_call_content_from_unified_diff(
     path: PathBuf,
     unified_diff: String,
-) -> Vec<ToolCallContent> {
+) -> (Vec<ToolCallLocation>, Vec<ToolCallContent>) {
     let Ok(patch) = diffy::Patch::from_str(&unified_diff) else {
-        return vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(unified_diff),
-        )))];
+        return (
+            vec![ToolCallLocation::new(path)],
+            vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                TextContent::new(unified_diff),
+            )))],
+        );
     };
 
-    let diffs = patch
-        .hunks()
-        .iter()
-        .map(|hunk| {
-            let mut old_text = String::new();
-            let mut new_text = String::new();
+    let line_numbers = extract_new_start_lines_from_unified_diff(&unified_diff);
+    let mut locations = Vec::new();
+    let mut diffs = Vec::new();
 
-            for line in hunk.lines() {
-                match line {
-                    diffy::Line::Context(text) => {
-                        old_text.push_str(text);
-                        new_text.push_str(text);
-                    }
-                    diffy::Line::Delete(text) => old_text.push_str(text),
-                    diffy::Line::Insert(text) => new_text.push_str(text),
+    for (index, hunk) in patch.hunks().iter().enumerate() {
+        let mut old_text = String::new();
+        let mut new_text = String::new();
+
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(text) => {
+                    old_text.push_str(text);
+                    new_text.push_str(text);
                 }
+                diffy::Line::Delete(text) => old_text.push_str(text),
+                diffy::Line::Insert(text) => new_text.push_str(text),
             }
+        }
 
-            ToolCallContent::Diff(Diff::new(path.clone(), new_text).old_text(old_text))
-        })
-        .collect_vec();
+        let location = match line_numbers.get(index).copied() {
+            Some(line) => ToolCallLocation::new(path.clone()).line(line),
+            None => ToolCallLocation::new(path.clone()),
+        };
+        locations.push(location);
+        diffs.push(ToolCallContent::Diff(
+            Diff::new(path.clone(), new_text).old_text(old_text),
+        ));
+    }
 
     if diffs.is_empty() {
-        vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(unified_diff),
-        )))]
+        (
+            vec![ToolCallLocation::new(path)],
+            vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                TextContent::new(unified_diff),
+            )))],
+        )
     } else {
-        diffs
+        (locations, diffs)
     }
+}
+
+fn extract_new_start_lines_from_unified_diff(unified_diff: &str) -> Vec<u32> {
+    unified_diff
+        .lines()
+        .filter_map(parse_new_start_line_from_hunk_header)
+        .collect()
+}
+
+fn parse_new_start_line_from_hunk_header(line: &str) -> Option<u32> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+
+    let (_, after_plus) = line.split_once(" +")?;
+    let new_range = after_plus.split_whitespace().next()?;
+    let start = new_range.split(',').next()?;
+    start.parse().ok()
 }
 
 fn guardian_assessment_tool_call_id(id: &str) -> String {
@@ -4368,6 +4409,79 @@ mod tests {
         assert!(!mode_trusts_project("read-only"));
         assert!(mode_trusts_project("auto"));
         assert!(mode_trusts_project("full-access"));
+    }
+
+    #[test]
+    fn extract_tool_call_content_from_unified_diff_sets_hunk_line_numbers() {
+        let path = PathBuf::from("src/main.rs");
+        let unified_diff = "\
+@@ -10,2 +10,3 @@
+ old a
+-old b
++new b
++new c
+";
+
+        let (locations, content) =
+            extract_tool_call_content_from_unified_diff(path.clone(), unified_diff.to_string());
+
+        assert_eq!(locations, vec![ToolCallLocation::new(path.clone()).line(10)]);
+        assert_eq!(content.len(), 1);
+        assert!(matches!(
+            &content[0],
+            ToolCallContent::Diff(Diff {
+                path: diff_path,
+                old_text: Some(old_text),
+                new_text,
+                ..
+            }) if diff_path == &path && old_text == "old a\nold b\n" && new_text == "old a\nnew b\nnew c\n"
+        ));
+    }
+
+    #[test]
+    fn extract_tool_call_content_from_unified_diff_tracks_multiple_hunks() {
+        let path = PathBuf::from("src/main.rs");
+        let unified_diff = "\
+@@ -3,2 +3,2 @@
+ line 3
+-line 4 old
++line 4 new
+@@ -20,2 +21,3 @@
+ line 20
+-line 21 old
++line 21 new
++line 22 new
+";
+
+        let (locations, content) =
+            extract_tool_call_content_from_unified_diff(path.clone(), unified_diff.to_string());
+
+        assert_eq!(
+            locations,
+            vec![
+                ToolCallLocation::new(path.clone()).line(3),
+                ToolCallLocation::new(path.clone()).line(21),
+            ]
+        );
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            ToolCallContent::Diff(Diff {
+                path: diff_path,
+                old_text: Some(old_text),
+                new_text,
+                ..
+            }) if diff_path == &path && old_text == "line 3\nline 4 old\n" && new_text == "line 3\nline 4 new\n"
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolCallContent::Diff(Diff {
+                path: diff_path,
+                old_text: Some(old_text),
+                new_text,
+                ..
+            }) if diff_path == &path && old_text == "line 20\nline 21 old\n" && new_text == "line 20\nline 21 new\nline 22 new\n"
+        ));
     }
 
     #[tokio::test]
